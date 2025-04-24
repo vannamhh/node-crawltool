@@ -1,0 +1,28 @@
+{
+  "totalProducts": 10,
+  "totalCollections": 1,
+  "crawledCollections": 0,
+  "productTypes": {},
+  "vendors": {
+    "Angeleno Heritage": 5,
+    "Breeze Decor": 5
+  },
+  "priceStats": {
+    "min": null,
+    "max": null,
+    "avg": null,
+    "median": null,
+    "ranges": {
+      "Under $10": 0,
+      "$10-$20": 0,
+      "$20-$50": 0,
+      "$50-$100": 0,
+      "Over $100": 0
+    }
+  },
+  "hasImages": 10,
+  "hasVariants": 10,
+  "onSale": 0,
+  "collectionsWithMostProducts": [],
+  "popularTags": {}
+}
