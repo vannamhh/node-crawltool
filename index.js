@@ -112,6 +112,41 @@ async function saveProgress(data, filename) {
   }
 }
 
+// URL utilities
+function makeAbsoluteUrl(url, baseUrl) {
+  if (!url) return null;
+  return url.startsWith('/') ? new URL(url, baseUrl).href : url;
+}
+
+// Image processing
+function getHighResImage(imageUrl) {
+  if (!imageUrl) return null;
+  if (imageUrl.includes('cdn.shopify.com')) {
+    return imageUrl.replace(/_(pico|icon|thumb|small|compact|medium|large|grande|original)_/, '_2048x2048_');
+  }
+  return imageUrl;
+}
+
+// Price formatting
+function normalizePrice(price) {
+  if (!price) return null;
+  return price > 10000 ? price / 100 : price;
+}
+
+// DOM utilities
+async function queryDomWithSelectors(page, selectors, attribute = 'textContent', transform = (x) => x.trim()) {
+  return page.evaluate((selectors, attribute, transform) => {
+    for (const selector of selectors.split(',')) {
+      const element = document.querySelector(selector.trim());
+      if (element) {
+        const value = element[attribute];
+        return transform ? transform(value) : value;
+      }
+    }
+    return null;
+  }, selectors, attribute, transform);
+}
+
 /**
  * Step-by-step crawler for Shopify products
  */
@@ -318,8 +353,96 @@ async function crawlShopifyProducts() {
                 await safeNavigate(page, productUrl);
                 console.log(`Successfully loaded product page`);
                 
-                // Extract product details
-                const productData = await page.evaluate(() => {
+                // Extract product JSON from ProductJson-product-template script
+                const productJsonData = await page.evaluate(() => {
+                  try {
+                    // Look for the script tag with product JSON data
+                    const scriptSelector = 'script#ProductJson-product-template, script#ProductJson-template, script[data-product-json]';
+                    const scriptElement = document.querySelector(scriptSelector);
+                    
+                    if (scriptElement) {
+                      // Parse the JSON content from the script tag
+                      const productJson = JSON.parse(scriptElement.textContent);
+                      return {
+                        productJson,
+                        found: true,
+                        source: 'product-template'
+                      };
+                    }
+                    
+                    // Try alternative methods if the standard script tag is not found
+                    // Look for script tags with application/json type that might contain product data
+                    const jsonScripts = Array.from(document.querySelectorAll('script[type="application/json"]'));
+                    for (const script of jsonScripts) {
+                      try {
+                        if (script.id && script.id.includes('Product')) {
+                          const data = JSON.parse(script.textContent);
+                          return {
+                            productJson: data,
+                            found: true,
+                            source: script.id
+                          };
+                        }
+                      } catch (e) {
+                        // Continue to next script if parsing fails
+                      }
+                    }
+                    
+                    // Look for inline product data in other script tags
+                    const allScripts = Array.from(document.querySelectorAll('script:not([src])'));
+                    for (const script of allScripts) {
+                      const content = script.textContent;
+                      
+                      // Try to find product JSON in various formats
+                      if (content.includes('var product =') || 
+                          content.includes('window.product =') || 
+                          content.includes('Product =')) {
+                        
+                        try {
+                          // Extract product JSON from script content
+                          const productMatch = content.match(/var\s+product\s*=\s*({[\s\S]*?});/) || 
+                                             content.match(/window\.product\s*=\s*({[\s\S]*?});/) ||
+                                             content.match(/Product\s*=\s*({[\s\S]*?});/);
+                          
+                          if (productMatch && productMatch[1]) {
+                            // Clean the JSON string and parse it
+                            const productJsonStr = productMatch[1].replace(/'/g, '"');
+                            const productData = JSON.parse(productJsonStr);
+                            
+                            return {
+                              productJson: productData,
+                              found: true,
+                              source: 'script-variable'
+                            };
+                          }
+                        } catch (e) {
+                          // Continue if parsing fails
+                        }
+                      }
+                    }
+                    
+                    return {
+                      found: false,
+                      source: null
+                    };
+                  } catch (error) {
+                    return {
+                      found: false,
+                      error: error.message
+                    };
+                  }
+                });
+                
+                // Log whether we found product JSON data
+                if (productJsonData.found) {
+                  console.log(`Found product JSON data from source: ${productJsonData.source}`);
+                  console.log(`Product has ${productJsonData.productJson.variants ? productJsonData.productJson.variants.length : 0} variants and ${productJsonData.productJson.images ? productJsonData.productJson.images.length : 0} images`);
+                } else {
+                  console.log('No product JSON data found in script tags, falling back to DOM scraping');
+                }
+                
+                // Extract product details 
+                const productData = await page.evaluate((productJsonData) => {
                   // Function to parse money values
                   const parseMoney = (moneyString) => {
                     if (!moneyString) return null;
@@ -330,557 +453,353 @@ async function crawlShopifyProducts() {
                   };
                   
                   try {
-                    // Collect all script tags for later use
-                    const scriptTags = Array.from(document.querySelectorAll('script:not([src])'));
+                    // Initialize variables based on existing DOM content
+                    let title, description, price, compareAtPrice, onSale, images, variants, options;
                     
-                    // Basic product info
-                    const title = document.querySelector('h1, .product-title, .product__title')?.textContent.trim();
-                    
-                    // Get full description - try different selectors used by Shopify themes
-                    const description = document.querySelector('.product__description')?.innerHTML.trim() || 
-                                       document.querySelector('.product-single__description')?.innerHTML.trim() || 
-                                       document.querySelector('[data-product-description]')?.innerHTML.trim() ||
-                                       document.querySelector('.product-description')?.innerHTML.trim() ||
-                                       document.querySelector('#product-description')?.innerHTML.trim() ||
-                                       document.querySelector('.description')?.innerHTML.trim() ||
-                                       document.querySelector('[itemprop="description"]')?.innerHTML.trim();
-                    
-                    // Price information
-                    let price = null;
-                    let compareAtPrice = null;
-                    let onSale = false;
-                    
-                    // Try multiple selectors for price elements
-                    const priceElement = document.querySelector('.price, .product__price, [data-product-price], .product-price, .price__current, .product-single__price, .price--item, [data-item="price"], [itemprop="price"]');
-                    
-                    if (priceElement) {
-                      // Remove hidden elements that might contain different prices
-                      const priceText = priceElement.textContent.trim();
-                      price = parseMoney(priceText);
+                    // Use the productJson data if found
+                    if (productJsonData && productJsonData.found && productJsonData.productJson) {
+                      const productJson = productJsonData.productJson;
                       
-                      // Check for compare-at price (original price before discount)
-                      const compareAtEl = document.querySelector('.price--compare-at, .product__price--compare, [data-compare-price], .compare-at-price, .product-compare-price, .price__old, .price--on-sale .price__sale, .product-single__price--compare, [data-item="comparePrice"]');
-                                         
-                      if (compareAtEl) {
-                        const compareText = compareAtEl.textContent.trim();
-                        compareAtPrice = parseMoney(compareText);
-                        onSale = compareAtPrice > price;
-                      }
-                    }
-                    
-                    // Get all product images with high resolution
-                    const images = [];
-                    
-                    // Try to get images from structured data first
-                    const jsonLds = document.querySelectorAll('script[type="application/ld+json"]');
-                    let foundImagesInJson = false;
-                    
-                    for (const jsonLd of jsonLds) {
-                      try {
-                        const data = JSON.parse(jsonLd.textContent);
-                        if (data && data['@type'] === 'Product' && data.image) {
-                          if (Array.isArray(data.image)) {
-                            // Process each image to ensure it's a full URL
-                            data.image.forEach(img => {
-                              if (typeof img === 'string') {
-                                // Ensure it's an absolute URL
-                                const fullUrl = new URL(img, window.location.origin).href;
-                                images.push(fullUrl);
-                              }
-                            });
-                          } else if (typeof data.image === 'string') {
-                            // Ensure it's an absolute URL
-                            const fullUrl = new URL(data.image, window.location.origin).href;
-                            images.push(fullUrl);
-                          }
-                          foundImagesInJson = true;
-                          break;
+                      // Basic product information from JSON
+                      title = productJson.title || '';
+                      description = productJson.description || '';
+                      
+                      // Price information - Shopify sometimes stores prices in cents
+                      if (productJson.price_min !== undefined) {
+                        // Price is already in dollars format
+                        price = productJson.price_min / 100;
+                        compareAtPrice = productJson.compare_at_price_min ? productJson.compare_at_price_min / 100 : null;
+                      } else if (productJson.price !== undefined) {
+                        // Handle case where price might be in cents
+                        if (productJson.price > 10000) {
+                          // Likely in cents
+                          price = productJson.price / 100;
+                          compareAtPrice = productJson.compare_at_price ? productJson.compare_at_price / 100 : null;
+                        } else {
+                          // Likely already in dollars
+                          price = productJson.price;
+                          compareAtPrice = productJson.compare_at_price || null;
                         }
-                      } catch (e) {
-                        // Continue if JSON parsing fails
+                      }
+                      
+                      // On sale status
+                      onSale = compareAtPrice !== null && compareAtPrice > price;
+                      
+                      // Get all product images
+                      if (productJson.images && Array.isArray(productJson.images)) {
+                        // Process image URLs
+                        images = productJson.images.map(img => {
+                          // Handle various image formats (string or object)
+                          let imageUrl;
+                          if (typeof img === 'string') {
+                            imageUrl = img;
+                          } else if (img.src) {
+                            imageUrl = img.src;
+                          } else {
+                            return null;
+                          }
+                          
+                          // Make relative URLs absolute
+                          if (!imageUrl.startsWith('http')) {
+                            imageUrl = new URL(imageUrl, window.location.origin).href;
+                          }
+                          
+                          // For Shopify CDN images, try to get high resolution
+                          if (imageUrl.includes('cdn.shopify.com')) {
+                            imageUrl = imageUrl.replace(/_(pico|icon|thumb|small|compact|medium|large|grande|original)_/, '_2048x2048_');
+                          }
+                          
+                          return imageUrl;
+                        }).filter(Boolean); // Remove null values
+                      } else {
+                        images = [];
+                      }
+                      
+                      // Get product options
+                      if (productJson.options && Array.isArray(productJson.options)) {
+                        options = productJson.options.map(opt => {
+                          if (typeof opt === 'string') {
+                            // Handle case where options might be just strings
+                            return {
+                              name: opt,
+                              values: []
+                            };
+                          } else {
+                            // Handle object format with name and values
+                            return {
+                              name: opt.name,
+                              values: opt.values || []
+                            };
+                          }
+                        });
+                      } else {
+                        options = [];
+                      }
+                      
+                      // Process variants with images
+                      if (productJson.variants && Array.isArray(productJson.variants)) {
+                        // Create a map of variant IDs to featured images
+                        const variantImageMap = new Map();
+                        
+                        // Map variant IDs to images
+                        if (productJson.images && Array.isArray(productJson.images)) {
+                          productJson.images.forEach(img => {
+                            if (img.variant_ids && Array.isArray(img.variant_ids)) {
+                              const imageUrl = img.src;
+                              // Make URL absolute and high-res
+                              let fullImageUrl = imageUrl;
+                              if (!fullImageUrl.startsWith('http')) {
+                                fullImageUrl = new URL(fullImageUrl, window.location.origin).href;
+                              }
+                              
+                              if (fullImageUrl.includes('cdn.shopify.com')) {
+                                fullImageUrl = fullImageUrl.replace(/_(pico|icon|thumb|small|compact|medium|large|grande|original)_/, '_2048x2048_');
+                              }
+                              
+                              // Map this image to all its variant IDs
+                              img.variant_ids.forEach(variantId => {
+                                variantImageMap.set(variantId.toString(), fullImageUrl);
+                              });
+                            }
+                          });
+                        }
+                        
+                        // Process all variants
+                        variants = productJson.variants.map(variant => {
+                          // Get price (handle if in cents)
+                          let variantPrice = variant.price;
+                          if (variantPrice > 10000) {
+                            variantPrice = variantPrice / 100;
+                          }
+                          
+                          // Get compare at price
+                          let variantComparePrice = variant.compare_at_price;
+                          if (variantComparePrice > 10000) {
+                            variantComparePrice = variantComparePrice / 100;
+                          }
+                          
+                          // Try to get variant image from different sources
+                          let variantImage = null;
+                          
+                          // Method 1: Check featured_image directly on variant
+                          if (variant.featured_image && variant.featured_image.src) {
+                            variantImage = variant.featured_image.src;
+                            
+                            // Make URL absolute and high-res
+                            if (!variantImage.startsWith('http')) {
+                              variantImage = new URL(variantImage, window.location.origin).href;
+                            }
+                            
+                            if (variantImage.includes('cdn.shopify.com')) {
+                              variantImage = variantImage.replace(/_(pico|icon|thumb|small|compact|medium|large|grande|original)_/, '_2048x2048_');
+                            }
+                          } 
+                          // Method 2: Check variant ID in the image map
+                          else if (variantImageMap.has(variant.id.toString())) {
+                            variantImage = variantImageMap.get(variant.id.toString());
+                          } 
+                          // Method 3: Fall back to product's first image
+                          else if (images && images.length > 0) {
+                            variantImage = images[0];
+                          }
+                          
+                          // Build variant object
+                          return {
+                            id: variant.id,
+                            title: variant.title,
+                            price: variantPrice || price,
+                            compareAtPrice: variantComparePrice || null,
+                            sku: variant.sku || '',
+                            available: variant.available !== undefined ? variant.available : (variant.inventory_quantity > 0),
+                            option1: variant.option1 || null,
+                            option2: variant.option2 || null,
+                            option3: variant.option3 || null,
+                            options: [variant.option1, variant.option2, variant.option3].filter(Boolean),
+                            image: variantImage
+                          };
+                        });
+                      } else {
+                        variants = [];
                       }
                     }
                     
-                    // If no images found in JSON-LD, try DOM
-                    if (!foundImagesInJson || images.length === 0) {
-                      // Look for image elements
-                      const imageSelectors = `
-                        .product__media img, .product-single__media img, .product-image, .product__image, 
-                        [data-product-image], .product-featured-img, .product-gallery__image img, 
-                        .product-single__photo img, #ProductPhotoImg, .product-main-image, 
-                        [data-zoom-image], .slick-slide img, .product__slide img, .swiper-slide img,
-                        img[itemprop="image"], .fotorama__img, .product-gallery__image, 
-                        .product-image-main img, .product_image img
-                      `;
+                    // If we didn't get data from JSON, fall back to DOM scraping
+                    if (!title) {
+                      // Collect all script tags for later use
+                      const scriptTags = Array.from(document.querySelectorAll('script:not([src])'));
                       
-                      const imageElements = document.querySelectorAll(imageSelectors);
+                      // Basic product info
+                      title = document.querySelector('h1, .product-title, .product__title')?.textContent.trim();
                       
-                      imageElements.forEach(img => {
-                        // Try multiple sources for the image URL
-                        let src = img.getAttribute('src') || 
+                      // Get full description - try different selectors used by Shopify themes
+                      description = document.querySelector('.product__description')?.innerHTML.trim() || 
+                                   document.querySelector('.product-single__description')?.innerHTML.trim() || 
+                                   document.querySelector('[data-product-description]')?.innerHTML.trim() ||
+                                   document.querySelector('.product-description')?.innerHTML.trim() ||
+                                   document.querySelector('#product-description')?.innerHTML.trim() ||
+                                   document.querySelector('.description')?.innerHTML.trim() ||
+                                   document.querySelector('[itemprop="description"]')?.innerHTML.trim();
+                      
+                      // Price information
+                      price = null;
+                      compareAtPrice = null;
+                      onSale = false;
+                      
+                      // Try multiple selectors for price elements
+                      const priceElement = document.querySelector('.price, .product__price, [data-product-price], .product-price, .price__current, .product-single__price, .price--item, [data-item="price"], [itemprop="price"]');
+                      
+                      if (priceElement) {
+                        // Remove hidden elements that might contain different prices
+                        const priceText = priceElement.textContent.trim();
+                        price = parseMoney(priceText);
+                        
+                        // Check for compare-at price (original price before discount)
+                        const compareAtEl = document.querySelector('.price--compare-at, .product__price--compare, [data-compare-price], .compare-at-price, .product-compare-price, .price__old, .price--on-sale .price__sale, .product-single__price--compare, [data-item="comparePrice"]');
+                                       
+                        if (compareAtEl) {
+                          const compareText = compareAtEl.textContent.trim();
+                          compareAtPrice = parseMoney(compareText);
+                          onSale = compareAtPrice > price;
+                        }
+                      }
+                      
+                      // Get all product images with high resolution
+                      images = [];
+                      
+                      // Try to get images from structured data first
+                      const jsonLds = document.querySelectorAll('script[type="application/ld+json"]');
+                      let foundImagesInJson = false;
+                      
+                      for (const jsonLd of jsonLds) {
+                        try {
+                          const data = JSON.parse(jsonLd.textContent);
+                          if (data && data['@type'] === 'Product' && data.image) {
+                            if (Array.isArray(data.image)) {
+                              // Process each image to ensure it's a full URL
+                              data.image.forEach(img => {
+                                if (typeof img === 'string') {
+                                  // Ensure it's an absolute URL
+                                  const fullUrl = new URL(img, window.location.origin).href;
+                                  images.push(fullUrl);
+                                }
+                              });
+                            } else if (typeof data.image === 'string') {
+                              // Ensure it's an absolute URL
+                              const fullUrl = new URL(data.image, window.location.origin).href;
+                              images.push(fullUrl);
+                            }
+                            foundImagesInJson = true;
+                            break;
+                          }
+                        } catch (e) {
+                          // Continue if JSON parsing fails
+                        }
+                      }
+                      
+                      // If no images found in JSON-LD, try DOM
+                      if (!foundImagesInJson || images.length === 0) {
+                        // Look for image elements
+                        const imageSelectors = `
+                          .product__media img, .product-single__media img, .product-image, .product__image, 
+                          [data-product-image], .product-featured-img, .product-gallery__image img, 
+                          .product-single__photo img, #ProductPhotoImg, .product-main-image, 
+                          [data-zoom-image], .slick-slide img, .product__slide img, .swiper-slide img,
+                          img[itemprop="image"], .fotorama__img, .product-gallery__image, 
+                          .product-image-main img, .product_image img
+                        `;
+                        
+                        const imageElements = document.querySelectorAll(imageSelectors);
+                        
+                        imageElements.forEach(img => {
+                          // Try multiple sources for the image URL
+                          let src = img.getAttribute('src') || 
                                  img.getAttribute('data-src') || 
                                  img.getAttribute('data-zoom-image') || 
                                  img.getAttribute('data-full-resolution') || 
                                  img.getAttribute('data-image') || 
                                  img.getAttribute('data-zoom-src') || '';
-                        
-                        // For empty src but backgroundImage style
-                        if (!src && img.style && img.style.backgroundImage) {
-                          const bgMatch = img.style.backgroundImage.match(/url\(['"]?(.*?)['"]?\)/);
-                          if (bgMatch && bgMatch[1]) {
-                            src = bgMatch[1];
-                          }
-                        }
-                        
-                        // Skip if still no src
-                        if (!src) return;
-                        
-                        // Make relative URLs absolute
-                        if (src && !src.startsWith('http')) {
-                          src = new URL(src, window.location.origin).href;
-                        }
-                        
-                        // Try to get high resolution version
-                        if (src.includes('_small') || src.includes('_medium') || src.includes('_large')) {
-                          src = src.replace(/_(?:small|medium|large|compact|grande)\./, '.');
-                        }
-                        
-                        // For Shopify CDN images, try to get the largest version
-                        if (src.includes('cdn.shopify.com')) {
-                          // Replace size parameter with 2048x2048 for high resolution
-                          src = src.replace(/_(pico|icon|thumb|small|compact|medium|large|grande|original)_/, '_2048x2048_');
-                        }
-                        
-                        if (src && !images.includes(src)) {
-                          images.push(src);
-                        }
-                      });
-                      
-                      // If still no images, look for image URLs in JSON data in script tags
-                      if (images.length === 0) {
-                        for (const script of scriptTags) {
-                          try {
-                            const content = script.textContent || script.innerText;
-                            // Look for image URLs in various JSON formats
-                            if (content.includes('"images"') || content.includes('"image"')) {
-                              // Find image URLs using regex
-                              const urlRegex = /"(?:(?:https?|ftp):\/\/|\/\/)(?:\S+)(?:png|jpe?g|gif|webp)"/gi;
-                              const matches = content.match(urlRegex);
-                              
-                              if (matches && matches.length > 0) {
-                                matches.forEach(url => {
-                                  // Remove quotes
-                                  const cleanUrl = url.replace(/"/g, '');
-                                  if (!images.includes(cleanUrl)) {
-                                    images.push(cleanUrl);
-                                  }
-                                });
-                                
-                                if (images.length > 0) {
-                                  break;
-                                }
-                              }
-                            }
-                          } catch (e) {
-                            // Ignore errors and continue
-                          }
-                        }
-                      }
-                    }
-                    
-                    // Extract variants
-                    let variants = [];
-                    let options = [];
-                    
-                    // Try to find variants in JSON
-                    let variantsFromJson = false;
-                    
-                    for (const script of scriptTags) {
-                      const content = script.textContent || script.innerText;
-                      
-                      if (content.includes('var meta =') || content.includes('window.ShopifyAnalytics.meta =')) {
-                        try {
-                          // Extract meta JSON (new format)
-                          const metaMatch = content.match(/var meta\s*=\s*([^;]*);/) || 
-                                          content.match(/window\.ShopifyAnalytics\.meta\s*=\s*([^;]*);/);
                           
-                          if (metaMatch && metaMatch[1]) {
-                            const meta = JSON.parse(metaMatch[1]);
-                            if (meta.product && meta.product.variants) {
-                              variants = meta.product.variants.map(v => {
-                                // Try to get variant image if available
-                                let variantImage = null;
-                                
-                                // Method 1: Direct featured_image in variant
-                                if (v.featured_image && v.featured_image.src) {
-                                  variantImage = v.featured_image.src;
-                                  
-                                  // Make relative URLs absolute
-                                  if (!variantImage.startsWith('http')) {
-                                    variantImage = new URL(variantImage, window.location.origin).href;
-                                  }
-                                  
-                                  // For Shopify CDN images, try to get high resolution
-                                  if (variantImage.includes('cdn.shopify.com')) {
-                                    variantImage = variantImage.replace(/_(pico|icon|thumb|small|compact|medium|large|grande|original)_/, '_2048x2048_');
-                                  }
-                                }
-                                
-                                // Method 2: Try to find image by variant option values in product images
-                                if (!variantImage && meta.product.images && meta.product.images.length > 0) {
-                                  // Get variant option values (e.g. "Blue", "Small", etc.)
-                                  const optionValues = [v.option1, v.option2, v.option3].filter(Boolean).map(val => val.toLowerCase());
-                                  
-                                  // Look for images with alt text or file name containing any of the variant options
-                                  const matchingImage = meta.product.images.find(img => {
-                                    // Check filename for option value matches
-                                    if (img.src) {
-                                      const filename = img.src.split('/').pop().toLowerCase();
-                                      if (optionValues.some(val => filename.includes(val))) {
-                                        return true;
-                                      }
-                                    }
-                                    
-                                    // Check alt text for option value matches
-                                    if (img.alt) {
-                                      const altText = img.alt.toLowerCase();
-                                      if (optionValues.some(val => altText.includes(val))) {
-                                        return true;
-                                      }
-                                    }
-                                    
-                                    return false;
-                                  });
-                                  
-                                  if (matchingImage && matchingImage.src) {
-                                    variantImage = matchingImage.src;
-                                    
-                                    // Make relative URLs absolute
-                                    if (!variantImage.startsWith('http')) {
-                                      variantImage = new URL(variantImage, window.location.origin).href;
-                                    }
-                                    
-                                    // For Shopify CDN images, try to get high resolution
-                                    if (variantImage.includes('cdn.shopify.com')) {
-                                      variantImage = variantImage.replace(/_(pico|icon|thumb|small|compact|medium|large|grande|original)_/, '_2048x2048_');
-                                    }
-                                  }
-                                }
-                                
-                                // Method 3: Fallback to first product image if no variant image found
-                                if (!variantImage && meta.product.images && meta.product.images.length > 0) {
-                                  const firstImage = meta.product.images[0];
-                                  if (firstImage && (firstImage.src || typeof firstImage === 'string')) {
-                                    variantImage = typeof firstImage === 'string' ? firstImage : firstImage.src;
-                                    
-                                    // Make relative URLs absolute
-                                    if (!variantImage.startsWith('http')) {
-                                      variantImage = new URL(variantImage, window.location.origin).href;
-                                    }
-                                    
-                                    // For Shopify CDN images, try to get high resolution
-                                    if (variantImage.includes('cdn.shopify.com')) {
-                                      variantImage = variantImage.replace(/_(pico|icon|thumb|small|compact|medium|large|grande|original)_/, '_2048x2048_');
-                                    }
-                                  }
-                                }
-                                
-                                return {
-                                  id: v.id,
-                                  title: v.name || v.title,
-                                  price: v.price / 100, // Shopify stores prices in cents
-                                  compareAtPrice: v.compare_at_price ? v.compare_at_price / 100 : null,
-                                  sku: v.sku,
-                                  available: v.available || v.inventory_quantity > 0,
-                                  options: v.options || [v.option1, v.option2, v.option3].filter(Boolean),
-                                  image: variantImage || (images && images.length > 0 ? images[0] : null)
-                                };
-                              });
-                              
-                              if (meta.product.options) {
-                                options = meta.product.options.map(o => ({
-                                  name: o.name,
-                                  values: o.values
-                                }));
-                              }
-                              
-                              // Also check for product images at the product level
-                              if (meta.product.images && meta.product.images.length > 0 && images.length === 0) {
-                                meta.product.images.forEach(img => {
-                                  if (typeof img === 'string') {
-                                    // Ensure it's an absolute URL
-                                    const fullUrl = new URL(img, window.location.origin).href;
-                                    images.push(fullUrl);
-                                  } else if (img.src) {
-                                    // Ensure it's an absolute URL
-                                    const fullUrl = new URL(img.src, window.location.origin).href;
-                                    images.push(fullUrl);
-                                  }
-                                });
-                              }
-                              
-                              variantsFromJson = true;
-                              break;
+                          // For empty src but backgroundImage style
+                          if (!src && img.style && img.style.backgroundImage) {
+                            const bgMatch = img.style.backgroundImage.match(/url\(['"]?(.*?)['"]?\)/);
+                            if (bgMatch && bgMatch[1]) {
+                              src = bgMatch[1];
                             }
                           }
-                        } catch (e) {
-                          // Continue to next method if this fails
-                        }
-                      }
-                      
-                      // Try older format
-                      if (!variantsFromJson && (content.includes('Product = ') || content.includes('var product ='))) {
-                        try {
-                          // Extract product JSON from script tag
-                          let match = content.match(/Product = (.*?);/) || 
-                                    content.match(/var product = (.*?);/) ||
-                                    content.match(/window\['Product'\] = (.*?);/);
                           
-                          if (match && match[1]) {
-                            const productJson = JSON.parse(match[1]);
-                            if (productJson && productJson.variants) {
-                              variants = productJson.variants.map(v => {
-                                // Try to get variant image
-                                let variantImage = null;
-                                
-                                // Method 1: Find matching image for this variant by ID
-                                if (productJson.images && v.featured_image) {
-                                  const featuredImageId = v.featured_image.id;
-                                  // Find image with matching ID
-                                  const matchingImage = productJson.images.find(img => 
-                                    img.id === featuredImageId || 
-                                    (img.variant_ids && img.variant_ids.includes(v.id))
-                                  );
-                                  
-                                  if (matchingImage && matchingImage.src) {
-                                    variantImage = matchingImage.src;
-                                    
-                                    // Make sure it's a full URL
-                                    if (!variantImage.startsWith('http')) {
-                                      variantImage = new URL(variantImage, window.location.origin).href;
-                                    }
-                                    
-                                    // For Shopify CDN images, try to get high resolution
-                                    if (variantImage.includes('cdn.shopify.com')) {
-                                      variantImage = variantImage.replace(/_(pico|icon|thumb|small|compact|medium|large|grande|original)_/, '_2048x2048_');
-                                    }
-                                  }
-                                }
-                                
-                                // Method 2: Try to find image by variant option values in product images
-                                if (!variantImage && productJson.images && productJson.images.length > 0) {
-                                  // Get variant option values (e.g. "Blue", "Small", etc.)
-                                  const optionValues = [v.option1, v.option2, v.option3].filter(Boolean).map(val => val.toLowerCase());
-                                  
-                                  // Look for images with alt text or file name containing any of the variant options
-                                  const matchingImage = productJson.images.find(img => {
-                                    // Check filename for option value matches
-                                    if (img.src) {
-                                      const filename = img.src.split('/').pop().toLowerCase();
-                                      if (optionValues.some(val => filename.includes(val))) {
-                                        return true;
-                                      }
-                                    }
-                                    
-                                    // Check alt text for option value matches
-                                    if (img.alt) {
-                                      const altText = img.alt.toLowerCase();
-                                      if (optionValues.some(val => altText.includes(val))) {
-                                        return true;
-                                      }
-                                    }
-                                    
-                                    return false;
-                                  });
-                                  
-                                  if (matchingImage && matchingImage.src) {
-                                    variantImage = matchingImage.src;
-                                    
-                                    // Make relative URLs absolute
-                                    if (!variantImage.startsWith('http')) {
-                                      variantImage = new URL(variantImage, window.location.origin).href;
-                                    }
-                                    
-                                    // For Shopify CDN images, try to get high resolution
-                                    if (variantImage.includes('cdn.shopify.com')) {
-                                      variantImage = variantImage.replace(/_(pico|icon|thumb|small|compact|medium|large|grande|original)_/, '_2048x2048_');
-                                    }
-                                  }
-                                }
-                                
-                                // Method 3: Fallback to first product image if no variant image found
-                                if (!variantImage && productJson.images && productJson.images.length > 0) {
-                                  const firstImage = productJson.images[0];
-                                  if (firstImage && firstImage.src) {
-                                    variantImage = firstImage.src;
-                                    
-                                    // Make sure it's a full URL
-                                    if (!variantImage.startsWith('http')) {
-                                      variantImage = new URL(variantImage, window.location.origin).href;
-                                    }
-                                    
-                                    // For Shopify CDN images, try to get high resolution
-                                    if (variantImage.includes('cdn.shopify.com')) {
-                                      variantImage = variantImage.replace(/_(pico|icon|thumb|small|compact|medium|large|grande|original)_/, '_2048x2048_');
-                                    }
-                                  }
-                                }
-                                
-                                return {
-                                  id: v.id,
-                                  title: v.title,
-                                  price: v.price / 100, // Shopify stores prices in cents
-                                  compareAtPrice: v.compare_at_price ? v.compare_at_price / 100 : null,
-                                  sku: v.sku,
-                                  available: v.available,
-                                  option1: v.option1,
-                                  option2: v.option2,
-                                  option3: v.option3,
-                                  image: variantImage || (images && images.length > 0 ? images[0] : null)
-                                };
-                              });
-                              
-                              if (productJson.options) {
-                                options = productJson.options.map(o => ({
-                                  name: o.name,
-                                  values: o.values
-                                }));
-                              }
-                              
-                              // Also check for product images at the product level
-                              if (productJson.images && productJson.images.length > 0 && images.length === 0) {
-                                productJson.images.forEach(img => {
-                                  if (typeof img === 'string') {
-                                    // Ensure it's an absolute URL
-                                    const fullUrl = new URL(img, window.location.origin).href;
-                                    images.push(fullUrl);
-                                  } else if (img.src) {
-                                    // Ensure it's an absolute URL
-                                    const fullUrl = new URL(img.src, window.location.origin).href;
-                                    images.push(fullUrl);
-                                  }
-                                });
-                              }
-                              
-                              variantsFromJson = true;
-                              break;
-                            }
+                          // Skip if still no src
+                          if (!src) return;
+                          
+                          // Make relative URLs absolute
+                          if (src && !src.startsWith('http')) {
+                            src = new URL(src, window.location.origin).href;
                           }
-                        } catch (e) {
-                          // If JSON parsing fails, continue to next script tag
-                        }
-                      }
-                    }
-                    
-                    // If no variants found in JSON, try to extract from DOM
-                    if (!variantsFromJson) {
-                      // Try to get variants from product form
-                      const variantElements = document.querySelectorAll('.product-form__option, .single-option-selector, select[data-option], .swatch, [data-product-variants], .product-options, .js-product-options');
-                      
-                      if (variantElements.length > 0) {
-                        options = Array.from(variantElements).map(el => {
-                          const optionName = el.getAttribute('data-option-name') || 
-                                           el.getAttribute('data-option') ||
-                                           el.querySelector('label')?.textContent.trim() || 
-                                           'Option';
-                                           
-                          const optionValues = Array.from(el.querySelectorAll('input, option, .swatch-element, [data-value]'))
-                            .map(input => input.value || input.getAttribute('data-value') || input.textContent.trim())
-                            .filter(v => v);
-                            
-                          return {
-                            name: optionName,
-                            values: optionValues
-                          };
+                          
+                          // Try to get high resolution version
+                          if (src.includes('_small') || src.includes('_medium') || src.includes('_large')) {
+                            src = src.replace(/_(?:small|medium|large|compact|grande)\./, '.');
+                          }
+                          
+                          // For Shopify CDN images, try to get the largest version
+                          if (src.includes('cdn.shopify.com')) {
+                            // Replace size parameter with 2048x2048 for high resolution
+                            src = src.replace(/_(pico|icon|thumb|small|compact|medium|large|grande|original)_/, '_2048x2048_');
+                          }
+                          
+                          if (src && !images.includes(src)) {
+                            images.push(src);
+                          }
                         });
+                      }
+                      
+                      // Extract variants from DOM if not already set from JSON
+                      if (!variants || variants.length === 0) {
+                        // Try to get variants from product form
+                        const variantElements = document.querySelectorAll('.product-form__option, .single-option-selector, select[data-option], .swatch, [data-product-variants], .product-options, .js-product-options');
                         
-                        // If we have option data but no variants, create basic variant objects
-                        if (options.length > 0) {
-                          // For simplicity, just create a dummy variant since we don't have accurate price data for each combination
+                        if (variantElements.length > 0) {
+                          options = Array.from(variantElements).map(el => {
+                            const optionName = el.getAttribute('data-option-name') || 
+                                             el.getAttribute('data-option') ||
+                                             el.querySelector('label')?.textContent.trim() || 
+                                             'Option';
+                                             
+                            const optionValues = Array.from(el.querySelectorAll('input, option, .swatch-element, [data-value]'))
+                              .map(input => input.value || input.getAttribute('data-value') || input.textContent.trim())
+                              .filter(v => v);
+                              
+                            return {
+                              name: optionName,
+                              values: optionValues
+                            };
+                          });
+                          
+                          // If we have option data but no variants, create basic variant objects
+                          if (options.length > 0) {
+                            // For simplicity, just create a dummy variant since we don't have accurate price data for each combination
+                            variants = [{
+                              title: 'Default Title',
+                              price: price,
+                              compareAtPrice: compareAtPrice,
+                              available: true,
+                              options: options,
+                              // Add default image to the variant
+                              image: images && images.length > 0 ? images[0] : null
+                            }];
+                          }
+                        } else {
+                          // Add a default variant
                           variants = [{
                             title: 'Default Title',
                             price: price,
                             compareAtPrice: compareAtPrice,
                             available: true,
-                            options: options,
                             // Add default image to the variant
                             image: images && images.length > 0 ? images[0] : null
                           }];
                         }
                       }
                     }
-                    
-                    // If still no variants, add a default variant
-                    if (variants.length === 0) {
-                      variants = [{
-                        title: 'Default Title',
-                        price: price,
-                        compareAtPrice: compareAtPrice,
-                        available: true,
-                        // Add default image to the variant
-                        image: images && images.length > 0 ? images[0] : null
-                      }];
-                    }
-                    
-                    // Final fallback check for image URLs if we still don't have any
-                    if (images.length === 0) {
-                      const allImages = document.querySelectorAll('img');
-                      const productKeywords = ['product', 'item', 'main', 'featured', 'gallery', 'zoom'];
-                      
-                      allImages.forEach(img => {
-                        const src = img.getAttribute('src');
-                        if (!src) return;
-                        
-                        // Check if this looks like a product image based on URL or containing element classes
-                        const isProductImage = productKeywords.some(keyword => 
-                          (src.toLowerCase().includes(keyword)) || 
-                          (img.className && img.className.toLowerCase().includes(keyword)) ||
-                          (img.id && img.id.toLowerCase().includes(keyword))
-                        );
-                        
-                        if (isProductImage && !src.includes('icon') && !src.includes('logo')) {
-                          // Make relative URLs absolute
-                          let fullSrc = src;
-                          if (!fullSrc.startsWith('http')) {
-                            fullSrc = new URL(fullSrc, window.location.origin).href;
-                          }
-                          
-                          // For Shopify CDN images, try to get high resolution
-                          if (fullSrc.includes('cdn.shopify.com')) {
-                            fullSrc = fullSrc.replace(/_(pico|icon|thumb|small|compact|medium|large|grande|original)_/, '_2048x2048_');
-                          }
-                          
-                          if (!images.includes(fullSrc)) {
-                            images.push(fullSrc);
-                          }
-                        }
-                      });
-                    }
-                    
-                    // Final fallback: If still no product images, create a placeholder image
-                    if (images.length === 0) {
-                      // Use the store's logo or a generic image URL as ultimate fallback
-                      const logoImg = document.querySelector('.site-header__logo img, .header__logo img, .logo img');
-                      if (logoImg && logoImg.src) {
-                        let logoSrc = logoImg.src;
-                        // Make relative URLs absolute
-                        if (!logoSrc.startsWith('http')) {
-                          logoSrc = new URL(logoSrc, window.location.origin).href;
-                        }
-                        images.push(logoSrc);
-                      } else {
-                        // Push store URL as identifier that we couldn't find an image
-                        images.push(window.location.origin + '/no-image-available');
-                      }
-                    }
-                    
-                    // Ensure absolutely no variant has a null image - final thorough check
-                    const defaultImage = images && images.length > 0 ? images[0] : null;
-                    variants.forEach(variant => {
-                      if (!variant.image) {
-                        variant.image = defaultImage;
-                      }
-                    });
                     
                     // Get product type and vendor
                     const productType = document.querySelector('.product-type, [itemprop="category"]')?.textContent.trim() || null;
@@ -918,6 +837,267 @@ async function crawlShopifyProducts() {
                       });
                     }
                     
+                    // Try to extract option_value -> image mapping from product JSON data
+                    try {
+                      // Find scripts containing productData with variant images
+                      const shopifyProductJson = document.querySelector('#ProductJson-product-template, #ProductJson-template, [data-product-json]');
+                      if (shopifyProductJson) {
+                        const productData = JSON.parse(shopifyProductJson.textContent);
+                        // Create direct variant ID to image mapping
+                        if (productData && productData.images && productData.variants) {
+                          const variantIdToImageMap = new Map();
+                          
+                          // Some shops store variant_ids directly on images
+                          productData.images.forEach(image => {
+                            if (image.variant_ids && Array.isArray(image.variant_ids)) {
+                              image.variant_ids.forEach(variantId => {
+                                let imageUrl = typeof image === 'string' ? image : image.src;
+                                // Make relative URLs absolute
+                                if (!imageUrl.startsWith('http')) {
+                                  imageUrl = new URL(imageUrl, window.location.origin).href;
+                                }
+                                // For Shopify CDN images, try to get high resolution
+                                if (imageUrl.includes('cdn.shopify.com')) {
+                                  imageUrl = imageUrl.replace(/_(pico|icon|thumb|small|compact|medium|large|grande|original)_/, '_2048x2048_');
+                                }
+                                variantIdToImageMap.set(variantId.toString(), imageUrl);
+                              });
+                            }
+                          });
+                          
+                          // Apply these images to variants
+                          if (variantIdToImageMap.size > 0) {
+                            variants.forEach(variant => {
+                              if (variant.id && variantIdToImageMap.has(variant.id.toString())) {
+                                variant.image = variantIdToImageMap.get(variant.id.toString());
+                              }
+                            });
+                          }
+                        }
+                      }
+                    } catch (e) {
+                      // Ignore errors in JSON parsing
+                    }
+                    
+                    // Extract Shopify's variant-specific image data
+                    try {
+                      // Look for scripts with variant featured_image data
+                      const scripts = document.querySelectorAll('script:not([src])');
+                      for (const script of scripts) {
+                        const content = script.textContent;
+                        
+                        // Look for variant selectors that change images
+                        if (content.includes('.variants =') || content.includes('product.variants =')) {
+                          // Try to extract variant data that maps to images
+                          const variantMappingRegex = /(\w+)\.variants\s*=\s*(\{[^;]*\}|\[[^;]*\])/g;
+                          const variantMatch = variantMappingRegex.exec(content);
+                          
+                          if (variantMatch) {
+                            // Try to find image switcher code
+                            const imageSwitcherRegex = /(\w+)\.variantImage\s*=\s*function\s*\([^)]*\)\s*\{([^}]*)\}/g;
+                            const imageSwitcherMatch = imageSwitcherRegex.exec(content);
+                            
+                            if (imageSwitcherMatch) {
+                              // Found code that switches images based on variants
+                              // This indicates the theme has variant-specific images
+                              console.log("Found variant image switcher code");
+                            }
+                          }
+                        }
+                        
+                        // Look for variant image map in newer Shopify themes
+                        if (content.includes('variantImages') || content.includes('variant_images') || 
+                            content.includes('variantImageMap') || content.includes('optionImageMap')) {
+                          const variantImageMapRegex = /(variantImages|variant_images|variantImageMap|optionImageMap)\s*=\s*(\{[^;]*\})/g;
+                          const mapMatch = variantImageMapRegex.exec(content);
+                          
+                          if (mapMatch) {
+                            // Found a direct map of variant IDs to images
+                            console.log("Found variant image map");
+                          }
+                        }
+                      }
+                    } catch (e) {
+                      // Ignore errors in regex or mapping
+                      console.error("Error parsing variant image data:", e);
+                    }
+                    
+                    // Look for variant image selectors common in many Shopify themes
+                    const variantImageSelectors = document.querySelectorAll('.product-single__thumbnail, .product-gallery__thumbnail, .product-thumbnails__item, [data-image-id], [data-variant-id], [data-variant-image], [data-image], [data-zoom-id], [data-media-id]');
+                    
+                    if (variantImageSelectors.length > 0) {
+                      // Create a map of variant option values to image URLs
+                      const variantOptionToImageMap = new Map();
+                      const variantIdToImageMap = new Map();
+                      const skuToImageMap = new Map();
+                      
+                      variantImageSelectors.forEach(selector => {
+                        // Try to get variant option value or ID from the selector
+                        const variantId = selector.getAttribute('data-variant-id') || 
+                                        selector.getAttribute('data-variant') || 
+                                        selector.getAttribute('data-value-id');
+                        
+                        const imageId = selector.getAttribute('data-image-id') || 
+                                      selector.getAttribute('data-zoom-id') || 
+                                      selector.getAttribute('data-media-id');
+                                      
+                        const sku = selector.getAttribute('data-sku') || 
+                                  selector.getAttribute('data-variant-sku');
+                                  
+                        const optionValue = selector.getAttribute('data-option-value') || 
+                                          selector.getAttribute('data-value') || 
+                                          selector.getAttribute('title') || 
+                                          selector.getAttribute('alt') ||
+                                          selector.textContent.trim();
+                        
+                        // Get the image URL from the selector
+                        let imageUrl = null;
+                        // Check for direct image URL attribute first
+                        imageUrl = selector.getAttribute('data-image') || 
+                                 selector.getAttribute('data-src') || 
+                                 selector.getAttribute('data-zoom-image') || 
+                                 selector.getAttribute('data-large-img') ||
+                                 selector.getAttribute('data-full-resolution') ||
+                                 selector.getAttribute('href');
+                        
+                        // If no direct attribute, check for img child
+                        if (!imageUrl) {
+                          const img = selector.querySelector('img');
+                          if (img) {
+                            imageUrl = img.getAttribute('data-src') || 
+                                     img.getAttribute('data-zoom-image') || 
+                                     img.getAttribute('data-full-resolution') ||
+                                     img.getAttribute('src');
+                          }
+                        }
+                        
+                        // Check for background image
+                        if (!imageUrl && selector.style && selector.style.backgroundImage) {
+                          const bgMatch = selector.style.backgroundImage.match(/url\(['"]?(.*?)['"]?\)/);
+                          if (bgMatch && bgMatch[1]) {
+                            imageUrl = bgMatch[1];
+                          }
+                        }
+                        
+                        // If we have both a variant identifier and an image URL, add to map
+                        if (imageUrl) {
+                          // Make relative URLs absolute
+                          if (!imageUrl.startsWith('http')) {
+                            imageUrl = new URL(imageUrl, window.location.origin).href;
+                          }
+                          
+                          // For Shopify CDN images, try to get high resolution
+                          if (imageUrl.includes('cdn.shopify.com')) {
+                            imageUrl = imageUrl.replace(/_(pico|icon|thumb|small|compact|medium|large|grande|original)_/, '_2048x2048_');
+                          }
+                          
+                          // Add to the appropriate map
+                          if (variantId) {
+                            variantIdToImageMap.set(variantId, imageUrl);
+                          }
+                          if (sku) {
+                            skuToImageMap.set(sku.toLowerCase(), imageUrl);
+                          }
+                          if (optionValue) {
+                            variantOptionToImageMap.set(optionValue.toLowerCase(), imageUrl);
+                          }
+                        }
+                      });
+                      
+                      // Also look for data-option-value attributes on thumbnail containers
+                      document.querySelectorAll('[data-option-value]').forEach(el => {
+                        const optionValue = el.getAttribute('data-option-value');
+                        if (!optionValue) return;
+                        
+                        // Find image associated with this option
+                        const img = el.querySelector('img');
+                        if (img && img.src) {
+                          let imageUrl = img.src;
+                          
+                          // Make relative URLs absolute
+                          if (!imageUrl.startsWith('http')) {
+                            imageUrl = new URL(imageUrl, window.location.origin).href;
+                          }
+                          
+                          // For Shopify CDN images, try to get high resolution
+                          if (imageUrl.includes('cdn.shopify.com')) {
+                            imageUrl = imageUrl.replace(/_(pico|icon|thumb|small|compact|medium|large|grande|original)_/, '_2048x2048_');
+                          }
+                          
+                          variantOptionToImageMap.set(optionValue.toLowerCase(), imageUrl);
+                        }
+                      });
+                      
+                      // Apply the mapped images to variants - prioritize more specific matches
+                      variants.forEach(variant => {
+                        // Only update if we don't already have an image for this variant
+                        if (variant.image && !variant.image.includes('/no-image-available')) {
+                          return;
+                        }
+                        
+                        // 1. Try to match by variant ID (most specific)
+                        if (variant.id && variantIdToImageMap.has(variant.id.toString())) {
+                          variant.image = variantIdToImageMap.get(variant.id.toString());
+                          return;
+                        }
+                        
+                        // 2. Try to match by SKU
+                        if (variant.sku && skuToImageMap.has(variant.sku.toLowerCase())) {
+                          variant.image = skuToImageMap.get(variant.sku.toLowerCase());
+                          return;
+                        }
+                        
+                        // 3. Try to match by option values
+                        const optionValues = [
+                          variant.option1, 
+                          variant.option2, 
+                          variant.option3
+                        ].filter(Boolean).map(val => val.toLowerCase());
+                        
+                        for (const optionValue of optionValues) {
+                          if (variantOptionToImageMap.has(optionValue)) {
+                            variant.image = variantOptionToImageMap.get(optionValue);
+                            return;
+                          }
+                        }
+                        
+                        // 4. If title has unique information, try to match with that
+                        if (variant.title) {
+                          const titleLower = variant.title.toLowerCase();
+                          // Check if any option value from the map is contained in the title
+                          for (const [optVal, imgUrl] of variantOptionToImageMap.entries()) {
+                            if (titleLower.includes(optVal)) {
+                              variant.image = imgUrl;
+                              return;
+                            }
+                          }
+                        }
+                      });
+                    }
+                    
+                    // Assign different product images to variants based on index if all else fails
+                    // This ensures at least some variation in images between variants
+                    if (images.length > 1 && variants.length > 1) {
+                      let allVariantsHaveSameImage = true;
+                      const firstImage = variants[0].image;
+                      
+                      for (let i = 1; i < variants.length; i++) {
+                        if (variants[i].image !== firstImage) {
+                          allVariantsHaveSameImage = false;
+                          break;
+                        }
+                      }
+                      
+                      // If all variants have the same image, distribute available product images
+                      if (allVariantsHaveSameImage) {
+                        for (let i = 0; i < variants.length; i++) {
+                          // Ensure we don't go out of bounds with images array
+                          const imageIndex = i % images.length;
+                          variants[i].image = images[imageIndex];
+                        }
+                      }
+                    }
+                    
                     return {
                       url,
                       handle,
@@ -937,7 +1117,7 @@ async function crawlShopifyProducts() {
                   } catch (error) {
                     return { error: error.message, trace: error.stack };
                   }
-                });
+                }, productJsonData);
                 
                 if (productData.error) {
                   console.error(`Error extracting data for ${productUrl}: ${productData.error}`);

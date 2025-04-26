@@ -1,3 +1,4 @@
 node_modules
 *shopify_products*.json
-sitemap_collections_1.xml
+sitemap*.xml
+processed_data

@@ -1,28 +1,85 @@
 {
-  "totalProducts": 10,
-  "totalCollections": 1,
+  "totalProducts": 818,
+  "totalCollections": 89,
   "crawledCollections": 0,
   "productTypes": {},
   "vendors": {
-    "Angeleno Heritage": 5,
-    "Breeze Decor": 5
+    "Two Group": 70,
+    "Breeze Decor": 318,
+    "Americana Home & Garden": 123,
+    "Ornament Collection": 107,
+    "FlagnGift.com": 3,
+    "Angeleno Heritage": 129,
+    "Ever Less": 29,
+    "USA Decoration": 39
   },
   "priceStats": {
-    "min": null,
-    "max": null,
-    "avg": null,
-    "median": null,
+    "min": 12,
+    "max": 51,
+    "avg": 22.742053789731052,
+    "median": 22,
     "ranges": {
       "Under $10": 0,
-      "$10-$20": 0,
-      "$20-$50": 0,
-      "$50-$100": 0,
+      "$10-$20": 10,
+      "$20-$50": 807,
+      "$50-$100": 1,
       "Over $100": 0
     }
   },
-  "hasImages": 10,
-  "hasVariants": 10,
-  "onSale": 0,
-  "collectionsWithMostProducts": [],
+  "hasImages": 812,
+  "hasVariants": 729,
+  "onSale": 818,
+  "collectionsWithMostProducts": [
+    {
+      "title": "More Decorative Flags ›",
+      "productCount": 15,
+      "url": "https://www.flagngift.com/collections/decorative-flags"
+    },
+    {
+      "title": "More Windsocks ›",
+      "productCount": 15,
+      "url": "https://www.flagngift.com/collections/windsocks"
+    },
+    {
+      "title": "More Twister Balls ›",
+      "productCount": 15,
+      "url": "https://www.flagngift.com/collections/twister-balls"
+    },
+    {
+      "title": "More Accessories ›",
+      "productCount": 15,
+      "url": "https://www.flagngift.com/collections/flag-accessories"
+    },
+    {
+      "title": "More Summer ›",
+      "productCount": 15,
+      "url": "https://www.flagngift.com/collections/summer-1"
+    },
+    {
+      "title": "More Fall ›",
+      "productCount": 15,
+      "url": "https://www.flagngift.com/collections/fall"
+    },
+    {
+      "title": "More Cinco de Mayo ›",
+      "productCount": 15,
+      "url": "https://www.flagngift.com/collections/cinco-de-mayo"
+    },
+    {
+      "title": "More Day of the Dead ›",
+      "productCount": 15,
+      "url": "https://www.flagngift.com/collections/day-of-the-dead"
+    },
+    {
+      "title": "More Hanukkah ›",
+      "productCount": 15,
+      "url": "https://www.flagngift.com/collections/hanukkah"
+    },
+    {
+      "title": "More Mardi Gras ›",
+      "productCount": 15,
+      "url": "https://www.flagngift.com/collections/mardi-gras"
+    }
+  ],
   "popularTags": {}
 }
